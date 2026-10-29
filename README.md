@@ -11,6 +11,7 @@
 - **文件就绪检测**：触发前用独占读句柄试打开，仍被占用则自动延迟重试，避免处理半截文件
 - **通配符过滤**：`*.zip;*.rar;*.7z`，支持 `*` 与 `?`，大小写不敏感
 - **动作模板**：`ActionCommand` 支持 `{filepath}` `{filename}` `{directory}` `{ext}` 占位符
+- **执行有兜底**：`.exe` / `.com` 直接启动（避开 cmd 的引号剥离），其余交给 `cmd /c`；单次执行 10 分钟超时会被结束，标准输出、错误输出与退出码都写进日志
 - **配置热重载**：改完 `config.ini` 保存，右键托盘 → “重新加载配置”即可生效，无需重启
 - **开机自启**：托盘菜单勾选即可，写入 `HKCU\...\CurrentVersion\Run`，不碰管理员权限
 - **日志轮转**：单个日志超过 1 MB 自动转存为 `.1`
@@ -31,7 +32,7 @@
 | `FileFilter` | 扩展名过滤，分号或逗号分隔，支持 `*` `?`；`*.*` 表示全部 | `*.*` |
 | `IncludeSubdirectories` | 是否递归监控子目录 | `false` |
 | `WatchChanged` | 是否响应“已有文件内容被修改” | `false` |
-| `ActionCommand` | 文件稳定后执行的命令，交给 `cmd /c` 执行 | 空（只记日志） |
+| `ActionCommand` | 文件稳定后执行的命令；`.exe`/`.com` 直接启动，其余（内置命令、`%VAR%`、重定向、`.bat`）走 `cmd /c` | 空（只记日志） |
 | `DebounceMs` | 去抖窗口（毫秒） | `300` |
 | `LogFile` | 日志文件，相对路径基于程序目录 | `monitor.log` |
 
@@ -74,7 +75,8 @@ Logger.cs                线程安全日志与轮转
 ## 说明
 
 - 只支持 Windows（依赖 WinForms、注册表、`FileSystemWatcher`）。
-- `ActionCommand` 由 `cmd /c` 执行，配置即代码，请勿使用来路不明的配置。
+- `ActionCommand` 最终会变成真实进程，配置即代码，请勿使用来路不明的配置。
+- 若动作程序需要 UAC 提权（Win32 错误 740），工具本身不会提权，日志里会给出对应提示。
 - 监控网络盘或超大目录时，`FileSystemWatcher` 内部缓冲区可能溢出，日志中会出现相应告警；可缩小监控范围或关闭子目录监控。
 
 ## License
