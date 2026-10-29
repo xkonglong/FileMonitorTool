@@ -12,10 +12,13 @@ namespace FileMonitorTool
     {
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "FileMonitorTool";
+        private const string TrayTextRunning = "文件监控工具 - 运行中";
+        private const string TrayTextStopped = "文件监控工具 - 已停止";
 
         private readonly string _configPath;
         private readonly NotifyIcon _notifyIcon;
         private readonly ContextMenuStrip _menu;
+        private readonly ToolStripMenuItem _toggleMonitorItem;
         private readonly ToolStripMenuItem _autoStartItem;
         private readonly Icon _trayIcon;
         private readonly bool _ownsIcon;
@@ -29,7 +32,6 @@ namespace FileMonitorTool
         {
             _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
 
-            // 先加载图标（同名 .ico 优先，否则用 exe 自身图标）
             _trayIcon = LoadTrayIcon(out _ownsIcon);
 
             _menu = new ContextMenuStrip();
@@ -38,8 +40,11 @@ namespace FileMonitorTool
             _menu.Items.Add("打开日志", null, (s, e) => OpenLog());
             _menu.Items.Add(new ToolStripSeparator());
 
+            _toggleMonitorItem = new ToolStripMenuItem("停止监控");
+            _toggleMonitorItem.Click += (s, e) => ToggleMonitor();
+            _menu.Items.Add(_toggleMonitorItem);
+
             _autoStartItem = new ToolStripMenuItem("开机启动") { CheckOnClick = true };
-            // 先设初始状态，再挂事件，避免初始化时触发写注册表
             _autoStartItem.Checked = IsAutoStartEnabled();
             _autoStartItem.CheckedChanged += OnAutoStartChanged;
             _menu.Items.Add(_autoStartItem);
@@ -50,7 +55,7 @@ namespace FileMonitorTool
             _notifyIcon = new NotifyIcon
             {
                 Icon = _trayIcon,
-                Text = "文件监控工具",
+                Text = TrayTextStopped,
                 Visible = true,
                 ContextMenuStrip = _menu
             };
@@ -67,8 +72,9 @@ namespace FileMonitorTool
             try
             {
                 string exePath = Application.ExecutablePath;
-                string icoPath = Path.ChangeExtension(exePath, ".ico");
-                Debug.WriteLine(icoPath);
+                string dir = Path.GetDirectoryName(exePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                string baseName = Path.GetFileNameWithoutExtension(exePath);
+                string icoPath = Path.Combine(dir, baseName + ".ico");
 
                 if (File.Exists(icoPath))
                 {
@@ -92,6 +98,47 @@ namespace FileMonitorTool
             return SystemIcons.Application;
         }
 
+        // ---------- 监控开关 ----------
+
+        private void ToggleMonitor()
+        {
+            if (_monitor == null)
+            {
+                // 异常情况（配置从未成功加载），尝试重建一次
+                ReloadConfig(true);
+                return;
+            }
+
+            if (_monitor.IsRunning)
+            {
+                _monitor.Stop();
+                Logger.Info("监控已停止");
+                ShowBalloon("监控已停止", _config != null ? _config.WatchPath : "", ToolTipIcon.Info);
+            }
+            else
+            {
+                try
+                {
+                    _monitor.Start();
+                    ShowBalloon("监控已启动", _config != null ? _config.WatchPath : "", ToolTipIcon.Info);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("启动监控失败", ex);
+                    ShowBalloon("启动失败", ex.Message, ToolTipIcon.Error);
+                }
+            }
+
+            UpdateMonitorMenuState();
+        }
+
+        private void UpdateMonitorMenuState()
+        {
+            bool running = _monitor != null && _monitor.IsRunning;
+            _toggleMonitorItem.Text = running ? "停止监控" : "开始监控";
+            _notifyIcon.Text = running ? TrayTextRunning : TrayTextStopped;
+        }
+
         // ---------- 开机启动 ----------
 
         private void OnAutoStartChanged(object sender, EventArgs e)
@@ -100,7 +147,6 @@ namespace FileMonitorTool
 
             if (!SetAutoStart(_autoStartItem.Checked))
             {
-                // 写注册表失败：回滚勾选状态
                 _suppressAutoStartEvent = true;
                 _autoStartItem.Checked = !_autoStartItem.Checked;
                 _suppressAutoStartEvent = false;
@@ -163,6 +209,10 @@ namespace FileMonitorTool
 
         private void ReloadConfig(bool showBalloon)
         {
+            // 保持原状态：首次启动（_monitor == null）自动运行；
+            // 用户主动停止后再重载，则保持停止状态
+            bool shouldRun = (_monitor == null) || _monitor.IsRunning;
+
             try
             {
                 if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
@@ -175,16 +225,25 @@ namespace FileMonitorTool
                 _executor = new ActionExecutor(_config.ActionCommand);
 
                 _monitor = new FileMonitor(_config, OnFileReady);
-                _monitor.Start();
 
-                _notifyIcon.Text = "文件监控工具 - 运行中";
+                if (shouldRun)
+                    _monitor.Start();
+                else
+                    Logger.Info("配置已重载，监控保持停止状态");
+
                 if (showBalloon)
-                    ShowBalloon("配置已重载", _config.WatchPath, ToolTipIcon.Info);
+                    ShowBalloon("配置已重载",
+                        shouldRun ? _config.WatchPath : "监控保持停止",
+                        ToolTipIcon.Info);
             }
             catch (Exception ex)
             {
                 Logger.Error("加载配置失败", ex);
                 ShowBalloon("配置错误", ex.Message, ToolTipIcon.Error);
+            }
+            finally
+            {
+                UpdateMonitorMenuState();
             }
         }
 

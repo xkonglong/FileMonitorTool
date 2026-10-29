@@ -9,11 +9,17 @@
     <Nullable>disable</Nullable>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <ApplicationIcon>APP.ico</ApplicationIcon>
-    <Description></Description>
-    <Copyright>小恐龙工作室</Copyright>
-    <PackageProjectUrl>https://xkonglong.com</PackageProjectUrl>
+
+    <!-- ===== 版本信息 ===== -->
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <InformationalVersion>1.1</InformationalVersion>
+
+    <!-- ===== 可选：exe 属性里显示的附加信息 ===== -->
+    <Product>FileMonitorTool</Product>
+    <Company>https://xkonglong.com</Company>
+    <Copyright>Copyright© 小恐龙工作室 2026</Copyright>
+    <Description>低资源文件监控工具（托盘版）</Description>
   </PropertyGroup>
-  <ItemGroup>
-    <Content Include="APP.ico" />
-  </ItemGroup>
 </Project>

@@ -11,6 +11,7 @@ namespace FileMonitorTool
         private readonly Action<string> _onFileReady;
         private FileSystemWatcher _watcher;
         private Debouncer _debouncer;
+        private volatile bool _running;
 
         public FileMonitor(Config config, Action<string> onFileReady)
         {
@@ -18,9 +19,12 @@ namespace FileMonitorTool
             _onFileReady = onFileReady;
         }
 
+        /// <summary>当前是否处于监控状态（Start 成功后为 true，Stop 后为 false）。</summary>
+        public bool IsRunning { get { return _running; } }
+
         public void Start()
         {
-            Stop();
+            Stop(); // 幂等：先停掉可能存在的旧 watcher
 
             if (string.IsNullOrWhiteSpace(_config.WatchPath))
                 throw new InvalidOperationException("配置项 WatchPath 为空。");
@@ -32,9 +36,9 @@ namespace FileMonitorTool
             _watcher = new FileSystemWatcher(_config.WatchPath)
             {
                 IncludeSubdirectories = _config.IncludeSubdirectories,
-                InternalBufferSize = 64 * 1024,          // 最大值，降低事件丢失概率
+                InternalBufferSize = 64 * 1024,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-                Filter = "*.*",                           // 先全收，再由 MatchesFilter 精筛
+                Filter = "*.*",
                 EnableRaisingEvents = false
             };
 
@@ -44,6 +48,7 @@ namespace FileMonitorTool
             _watcher.Error += OnWatcherError;
 
             _watcher.EnableRaisingEvents = true;
+            _running = true;
 
             Logger.Info(string.Format("开始监控: {0} | 过滤: {1} | 子目录: {2} | 去抖: {3}ms",
                 _config.WatchPath, _config.FileFilter, _config.IncludeSubdirectories, _config.DebounceMs));
@@ -51,6 +56,8 @@ namespace FileMonitorTool
 
         public void Stop()
         {
+            _running = false;
+
             if (_watcher != null)
             {
                 try { _watcher.EnableRaisingEvents = false; } catch { }
@@ -60,6 +67,7 @@ namespace FileMonitorTool
 
             if (_debouncer != null)
             {
+                // Dispose 后所有待触发的去抖事件都被丢弃
                 _debouncer.Dispose();
                 _debouncer = null;
             }
@@ -71,9 +79,10 @@ namespace FileMonitorTool
 
         private void TryEnqueue(string fullPath)
         {
+            if (!_running) return;
             if (string.IsNullOrEmpty(fullPath)) return;
-            if (Directory.Exists(fullPath)) return;                 // 忽略目录事件
-            if (!MatchesFilter(Path.GetFileName(fullPath))) return; // 类型过滤放在入口，减少后续开销
+            if (Directory.Exists(fullPath)) return;
+            if (!MatchesFilter(Path.GetFileName(fullPath))) return;
 
             var debouncer = _debouncer;
             if (debouncer != null) debouncer.Add(fullPath);
@@ -91,7 +100,6 @@ namespace FileMonitorTool
             return false;
         }
 
-        /// <summary>只支持 * 和 ? 的简单通配，大小写不敏感。</summary>
         private static bool WildcardMatch(string input, string pattern)
         {
             string regex = "^" + Regex.Escape(pattern)
@@ -100,25 +108,26 @@ namespace FileMonitorTool
             return Regex.IsMatch(input, regex, RegexOptions.IgnoreCase);
         }
 
-        /// <summary>去抖窗口结束后触发：确认文件存在且可读，再交给动作层。</summary>
         private void HandleFileSettled(string fullPath)
         {
+            if (!_running) return; // 停止后到达的回调直接丢弃
+
             try
             {
-                if (!File.Exists(fullPath)) return; // 期间被删除或改名走了
+                if (!File.Exists(fullPath)) return;
                 if (IsFileReady(fullPath))
                 {
                     _onFileReady(fullPath);
                     return;
                 }
 
-                // 仍被占用（复制未完成 / 编辑器未释放），延迟再试一次
                 Timer retry = null;
                 int delay = Math.Max(500, _config.DebounceMs * 2);
                 retry = new Timer(_ =>
                 {
                     try
                     {
+                        if (!_running) return;
                         if (File.Exists(fullPath) && IsFileReady(fullPath))
                             _onFileReady(fullPath);
                         else
