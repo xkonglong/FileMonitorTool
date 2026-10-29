@@ -20,8 +20,8 @@
 
 ## 使用
 
-1. 把 `config.ini.example` 复制为 `config.ini`（放在 exe 同目录），按需修改。
-2. 运行 `FileMonitorTool.exe`，托盘出现图标即开始监控。
+1. 运行 `FileMonitorTool.exe`，托盘出现图标即开始监控。
+2. 修改配置文件 `config.ini`，指定监控文件夹路径、文件类型等。
 3. 右键托盘图标：
    - 打开配置文件 / 重新加载配置 / 打开日志 / 停止监控（或开始监控）/ 开机启动 / 退出
 
