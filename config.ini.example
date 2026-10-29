@@ -1,0 +1,31 @@
+# ===== 文件监控工具配置 =====
+# 用法：复制本文件为 config.ini（与 exe 同目录），修改保存后
+# 右键托盘图标 -> "重新加载配置" 即可生效
+
+# 要监控的文件夹（必须存在）
+WatchPath=D:\DropFolder
+
+# 文件类型过滤，分号分隔，支持 * 和 ? 通配符；*.* 表示全部
+FileFilter=*.zip;*.rar;*.7z;*.exe;*.msi
+
+# 是否监控子目录
+IncludeSubdirectories=false
+
+# 是否监听"已有文件内容被修改"（默认只关注新放入/改名进来的文件）
+WatchChanged=false
+
+# 文件稳定后（去抖窗口结束）执行的动作，由 cmd /c 执行，支持占位符：
+#   {filepath} 完整路径   {filename} 文件名   {directory} 所在目录   {ext} 扩展名
+# 示例1：记录到临时文件
+#ActionCommand=echo 检测到文件: "{filepath}" >> "%TEMP%\filemonitor_hits.txt"
+# 示例2：复制到归档目录
+#ActionCommand=xcopy /Y "{filepath}" "D:\Archive\"
+# 示例3：调用外部程序
+#ActionCommand="C:\Tools\MyTool.exe" --input "{filepath}"
+ActionCommand=
+
+# 去抖窗口（毫秒）：文件连续变化时，静默超过该时长才触发动作
+DebounceMs=300
+
+# 日志文件（相对路径基于程序目录）
+LogFile=monitor.log

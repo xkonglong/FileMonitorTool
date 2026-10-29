@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>FileMonitorTool</AssemblyName>
+    <RootNamespace>FileMonitorTool</RootNamespace>
+    <Nullable>disable</Nullable>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <ApplicationIcon>APP.ico</ApplicationIcon>
+    <Description></Description>
+    <Copyright>小恐龙工作室</Copyright>
+    <PackageProjectUrl>https://xkonglong.com</PackageProjectUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="APP.ico" />
+  </ItemGroup>
+</Project>

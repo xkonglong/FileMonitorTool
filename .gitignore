@@ -1,0 +1,11 @@
+# 构建产物
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# 本机配置与运行日志（配置模板见 config.ini.example）
+config.ini
+monitor.log
+monitor.log.1
