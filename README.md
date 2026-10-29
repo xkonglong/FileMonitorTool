@@ -76,3 +76,7 @@ Logger.cs                线程安全日志与轮转
 - 只支持 Windows（依赖 WinForms、注册表、`FileSystemWatcher`）。
 - `ActionCommand` 由 `cmd /c` 执行，配置即代码，请勿使用来路不明的配置。
 - 监控网络盘或超大目录时，`FileSystemWatcher` 内部缓冲区可能溢出，日志中会出现相应告警；可缩小监控范围或关闭子目录监控。
+
+## License
+
+[MIT](LICENSE) © 小恐龙
