@@ -14,14 +14,21 @@ namespace FileMonitorTool
         private const string RunValueName = "FileMonitorTool";
         private const string TrayTextRunning = "文件监控工具 - 运行中";
         private const string TrayTextStopped = "文件监控工具 - 已停止";
+        private const string StoppedIconResource = "FileMonitorTool.stop.ico";
 
         private readonly string _configPath;
         private readonly NotifyIcon _notifyIcon;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _toggleMonitorItem;
         private readonly ToolStripMenuItem _autoStartItem;
-        private readonly Icon _trayIcon;
-        private readonly bool _ownsIcon;
+
+        // 运行态图标：同名 .ico / exe 自身图标 / 系统图标
+        private readonly Icon _runningIcon;
+        private readonly bool _ownsRunningIcon;
+
+        // 停止态图标：内嵌资源 stop.ico
+        private readonly Icon _stoppedIcon;
+        private readonly bool _ownsStoppedIcon;
 
         private Config _config;
         private FileMonitor _monitor;
@@ -32,7 +39,9 @@ namespace FileMonitorTool
         {
             _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
 
-            _trayIcon = LoadTrayIcon(out _ownsIcon);
+            // 两套图标在构造时各取一次并缓存，避免每帧切换都重新反序列化
+            _runningIcon = LoadRunningIcon(out _ownsRunningIcon);
+            _stoppedIcon = LoadStoppedIcon(out _ownsStoppedIcon);
 
             _menu = new ContextMenuStrip();
             _menu.Items.Add("打开配置文件", null, (s, e) => OpenConfig());
@@ -54,7 +63,8 @@ namespace FileMonitorTool
 
             _notifyIcon = new NotifyIcon
             {
-                Icon = _trayIcon,
+                // 初始按“未启动”处理，ReloadConfig 会立刻把它切到实际状态
+                Icon = _stoppedIcon ?? _runningIcon,
                 Text = TrayTextStopped,
                 Visible = true,
                 ContextMenuStrip = _menu
@@ -64,9 +74,12 @@ namespace FileMonitorTool
             ReloadConfig(false);
         }
 
-        // ---------- 托盘图标加载 ----------
+        // ---------- 图标加载 ----------
 
-        private static Icon LoadTrayIcon(out bool ownsIcon)
+        /// <summary>
+        /// 运行态图标：同目录 <exe名>.ico 优先，否则提取 exe 自身图标，最后回退系统图标。
+        /// </summary>
+        private static Icon LoadRunningIcon(out bool ownsIcon)
         {
             ownsIcon = false;
             try
@@ -93,9 +106,35 @@ namespace FileMonitorTool
             }
             catch (Exception ex)
             {
-                Logger.Warn("加载托盘图标失败，改用系统默认图标: " + ex.Message);
+                Logger.Warn("加载运行图标失败，改用系统默认图标: " + ex.Message);
             }
-            return SystemIcons.Application;
+            return SystemIcons.Application; // 共享实例，ownsIcon 保持 false
+        }
+
+        /// <summary>
+        /// 停止态图标：直接读取内嵌的 stop.ico（见 csproj 里的 EmbeddedResource）。
+        /// 取一次后缓存，由本类负责释放；资源缺失时返回 null，调用方回退到运行图标。
+        /// </summary>
+        private static Icon LoadStoppedIcon(out bool ownsIcon)
+        {
+            ownsIcon = false;
+            try
+            {
+                using (Stream stream = typeof(TrayApplication).Assembly.GetManifestResourceStream(StoppedIconResource))
+                {
+                    if (stream != null)
+                    {
+                        ownsIcon = true; // Icon(Stream) 读出的是独立副本，由本类释放
+                        return new Icon(stream);
+                    }
+                }
+                Logger.Warn("未找到内嵌图标 " + StoppedIconResource + "，停止时将沿用运行图标。");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("加载停止图标失败，停止时将沿用运行图标: " + ex.Message);
+            }
+            return null;
         }
 
         // ---------- 监控开关 ----------
@@ -104,7 +143,6 @@ namespace FileMonitorTool
         {
             if (_monitor == null)
             {
-                // 异常情况（配置从未成功加载），尝试重建一次
                 ReloadConfig(true);
                 return;
             }
@@ -135,8 +173,14 @@ namespace FileMonitorTool
         private void UpdateMonitorMenuState()
         {
             bool running = _monitor != null && _monitor.IsRunning;
+
             _toggleMonitorItem.Text = running ? "停止监控" : "开始监控";
             _notifyIcon.Text = running ? TrayTextRunning : TrayTextStopped;
+
+            // 停止态优先用 Resources.stop；缺失则回退到运行图标
+            Icon target = running ? _runningIcon : (_stoppedIcon ?? _runningIcon);
+            if (!ReferenceEquals(_notifyIcon.Icon, target) && target != null)
+                _notifyIcon.Icon = target;
         }
 
         // ---------- 开机启动 ----------
@@ -209,8 +253,6 @@ namespace FileMonitorTool
 
         private void ReloadConfig(bool showBalloon)
         {
-            // 保持原状态：首次启动（_monitor == null）自动运行；
-            // 用户主动停止后再重载，则保持停止状态
             bool shouldRun = (_monitor == null) || _monitor.IsRunning;
 
             try
@@ -298,28 +340,25 @@ namespace FileMonitorTool
         private void Exit()
         {
             if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
-
             _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
-
-            if (_ownsIcon && _trayIcon != null)
-            {
-                try { _trayIcon.Dispose(); } catch { }
-            }
-
             Application.ExitThread();
         }
 
         public void Dispose()
         {
             if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
-            try { _notifyIcon.Visible = false; } catch { }
-            _notifyIcon.Dispose();
-            _menu.Dispose();
 
-            if (_ownsIcon && _trayIcon != null)
+            try { _notifyIcon.Visible = false; } catch { }
+            try { _notifyIcon.Dispose(); } catch { }
+            try { _menu.Dispose(); } catch { }
+
+            if (_ownsRunningIcon && _runningIcon != null)
             {
-                try { _trayIcon.Dispose(); } catch { }
+                try { _runningIcon.Dispose(); } catch { }
+            }
+            if (_ownsStoppedIcon && _stoppedIcon != null)
+            {
+                try { _stoppedIcon.Dispose(); } catch { }
             }
         }
     }

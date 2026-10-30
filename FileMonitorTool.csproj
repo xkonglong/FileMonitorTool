@@ -11,10 +11,10 @@
     <ApplicationIcon>APP.ico</ApplicationIcon>
 
     <!-- ===== 版本信息 ===== -->
-    <Version>1.1.0</Version>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
-    <FileVersion>1.1.0.0</FileVersion>
-    <InformationalVersion>1.1</InformationalVersion>
+    <Version>1.2.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
+    <FileVersion>1.2.0.0</FileVersion>
+    <InformationalVersion>1.2</InformationalVersion>
 
     <!-- ===== 可选：exe 属性里显示的附加信息 ===== -->
     <Product>FileMonitorTool</Product>
@@ -22,4 +22,10 @@
     <Copyright>Copyright© 小恐龙工作室 2026</Copyright>
     <Description>低资源文件监控工具（托盘版）</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- 图标直接以原始资源内嵌，避免 .resx 存二进制图标（新版 MSBuild 已不支持其序列化方式） -->
+    <EmbeddedResource Include="stop.ico" LogicalName="FileMonitorTool.stop.ico" />
+    <EmbeddedResource Remove="Properties\Resources.resx" />
+    <Compile Remove="Properties\Resources.Designer.cs" />
+  </ItemGroup>
 </Project>
