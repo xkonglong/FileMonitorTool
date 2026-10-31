@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace FileMonitorTool
@@ -19,12 +18,11 @@ namespace FileMonitorTool
             _onFileReady = onFileReady;
         }
 
-        /// <summary>当前是否处于监控状态（Start 成功后为 true，Stop 后为 false）。</summary>
         public bool IsRunning { get { return _running; } }
 
         public void Start()
         {
-            Stop(); // 幂等：先停掉可能存在的旧 watcher
+            Stop();
 
             if (string.IsNullOrWhiteSpace(_config.WatchPath))
                 throw new InvalidOperationException("配置项 WatchPath 为空。");
@@ -50,8 +48,9 @@ namespace FileMonitorTool
             _watcher.EnableRaisingEvents = true;
             _running = true;
 
-            Logger.Info(string.Format("开始监控: {0} | 过滤: {1} | 子目录: {2} | 去抖: {3}ms",
-                _config.WatchPath, _config.FileFilter, _config.IncludeSubdirectories, _config.DebounceMs));
+            Logger.Info(string.Format("开始监控: {0} | 规则数: {1} | 子目录: {2} | 去抖: {3}ms | 并发: {4}",
+                _config.WatchPath, _config.Rules.Count, _config.IncludeSubdirectories,
+                _config.DebounceMs, _config.MaxConcurrentActions));
         }
 
         public void Stop()
@@ -67,7 +66,6 @@ namespace FileMonitorTool
 
             if (_debouncer != null)
             {
-                // Dispose 后所有待触发的去抖事件都被丢弃
                 _debouncer.Dispose();
                 _debouncer = null;
             }
@@ -82,35 +80,21 @@ namespace FileMonitorTool
             if (!_running) return;
             if (string.IsNullOrEmpty(fullPath)) return;
             if (Directory.Exists(fullPath)) return;
-            if (!MatchesFilter(Path.GetFileName(fullPath))) return;
+            if (!_config.ShouldTrackFile(Path.GetFileName(fullPath)))
+            {
+                // 预筛掉的文件本来不会进入去抖，但 LogUnmatched 打开时仍留一条痕迹
+                if (_config.LogUnmatched)
+                    Logger.Info("未匹配任何规则，已忽略: " + fullPath);
+                return;
+            }
 
             var debouncer = _debouncer;
             if (debouncer != null) debouncer.Add(fullPath);
         }
 
-        private bool MatchesFilter(string fileName)
-        {
-            foreach (string raw in _config.Filters)
-            {
-                string pattern = raw.Trim();
-                if (pattern.Length == 0) continue;
-                if (pattern == "*.*" || pattern == "*") return true;
-                if (WildcardMatch(fileName, pattern)) return true;
-            }
-            return false;
-        }
-
-        private static bool WildcardMatch(string input, string pattern)
-        {
-            string regex = "^" + Regex.Escape(pattern)
-                .Replace("\\*", ".*")
-                .Replace("\\?", ".") + "$";
-            return Regex.IsMatch(input, regex, RegexOptions.IgnoreCase);
-        }
-
         private void HandleFileSettled(string fullPath)
         {
-            if (!_running) return; // 停止后到达的回调直接丢弃
+            if (!_running) return;
 
             try
             {

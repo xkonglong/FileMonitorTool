@@ -14,7 +14,9 @@ namespace FileMonitorTool
         private const string RunValueName = "FileMonitorTool";
         private const string TrayTextRunning = "文件监控工具 - 运行中";
         private const string TrayTextStopped = "文件监控工具 - 已停止";
-        private const string StoppedIconResource = "FileMonitorTool.stop.ico";
+
+        // 与 csproj 中 <EmbeddedResource ... LogicalName="FileMonitorTool.stop.ico" /> 保持一致
+        private const string StoppedIconResourceName = "FileMonitorTool.stop.ico";
 
         private readonly string _configPath;
         private readonly NotifyIcon _notifyIcon;
@@ -22,11 +24,9 @@ namespace FileMonitorTool
         private readonly ToolStripMenuItem _toggleMonitorItem;
         private readonly ToolStripMenuItem _autoStartItem;
 
-        // 运行态图标：同名 .ico / exe 自身图标 / 系统图标
         private readonly Icon _runningIcon;
         private readonly bool _ownsRunningIcon;
 
-        // 停止态图标：内嵌资源 stop.ico
         private readonly Icon _stoppedIcon;
         private readonly bool _ownsStoppedIcon;
 
@@ -39,7 +39,6 @@ namespace FileMonitorTool
         {
             _configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
 
-            // 两套图标在构造时各取一次并缓存，避免每帧切换都重新反序列化
             _runningIcon = LoadRunningIcon(out _ownsRunningIcon);
             _stoppedIcon = LoadStoppedIcon(out _ownsStoppedIcon);
 
@@ -63,7 +62,6 @@ namespace FileMonitorTool
 
             _notifyIcon = new NotifyIcon
             {
-                // 初始按“未启动”处理，ReloadConfig 会立刻把它切到实际状态
                 Icon = _stoppedIcon ?? _runningIcon,
                 Text = TrayTextStopped,
                 Visible = true,
@@ -76,9 +74,6 @@ namespace FileMonitorTool
 
         // ---------- 图标加载 ----------
 
-        /// <summary>
-        /// 运行态图标：同目录 <exe名>.ico 优先，否则提取 exe 自身图标，最后回退系统图标。
-        /// </summary>
         private static Icon LoadRunningIcon(out bool ownsIcon)
         {
             ownsIcon = false;
@@ -108,27 +103,29 @@ namespace FileMonitorTool
             {
                 Logger.Warn("加载运行图标失败，改用系统默认图标: " + ex.Message);
             }
-            return SystemIcons.Application; // 共享实例，ownsIcon 保持 false
+            return SystemIcons.Application;
         }
 
         /// <summary>
-        /// 停止态图标：直接读取内嵌的 stop.ico（见 csproj 里的 EmbeddedResource）。
-        /// 取一次后缓存，由本类负责释放；资源缺失时返回 null，调用方回退到运行图标。
+        /// 停止态图标：从程序集嵌入资源（原始 ico 流）读取。
+        /// 取一次后缓存，由本类负责释放。资源缺失时返回 null，调用方回退到运行图标。
         /// </summary>
         private static Icon LoadStoppedIcon(out bool ownsIcon)
         {
             ownsIcon = false;
             try
             {
-                using (Stream stream = typeof(TrayApplication).Assembly.GetManifestResourceStream(StoppedIconResource))
+                var asm = typeof(TrayApplication).Assembly;
+                using (var stream = asm.GetManifestResourceStream(StoppedIconResourceName))
                 {
                     if (stream != null)
                     {
-                        ownsIcon = true; // Icon(Stream) 读出的是独立副本，由本类释放
-                        return new Icon(stream);
+                        var icon = new Icon(stream);   // 构造时读完整流，之后关闭流安全
+                        ownsIcon = true;
+                        return icon;
                     }
                 }
-                Logger.Warn("未找到内嵌图标 " + StoppedIconResource + "，停止时将沿用运行图标。");
+                Logger.Warn("嵌入资源 '" + StoppedIconResourceName + "' 不存在，停止时将沿用运行图标。");
             }
             catch (Exception ex)
             {
@@ -177,7 +174,6 @@ namespace FileMonitorTool
             _toggleMonitorItem.Text = running ? "停止监控" : "开始监控";
             _notifyIcon.Text = running ? TrayTextRunning : TrayTextStopped;
 
-            // 停止态优先用 Resources.stop；缺失则回退到运行图标
             Icon target = running ? _runningIcon : (_stoppedIcon ?? _runningIcon);
             if (!ReferenceEquals(_notifyIcon.Icon, target) && target != null)
                 _notifyIcon.Icon = target;
@@ -264,7 +260,14 @@ namespace FileMonitorTool
 
                 _config = Config.Load(_configPath);
                 Logger.Initialize(ResolveLogPath(_config.LogFile));
-                _executor = new ActionExecutor(_config.ActionCommand);
+
+                if (!string.IsNullOrEmpty(_config.LegacyWarning))
+                    Logger.Warn(_config.LegacyWarning);
+                foreach (var w in _config.Warnings)
+                    Logger.Warn("[配置校验] " + w);
+
+                if (_executor != null) { _executor.Dispose(); _executor = null; }
+                _executor = new ActionExecutor(_config);
 
                 _monitor = new FileMonitor(_config, OnFileReady);
 
@@ -273,10 +276,20 @@ namespace FileMonitorTool
                 else
                     Logger.Info("配置已重载，监控保持停止状态");
 
-                if (showBalloon)
+                bool noRules = _config.Rules.Count == 0;
+                if (noRules)
+                {
+                    Logger.Warn("当前没有任何有效规则，不会监控任何文件。");
+                    ShowBalloon("没有有效规则",
+                        "请检查 config.ini：每条规则需要同时有 Ext/Name 和 Command。",
+                        ToolTipIcon.Warning);
+                }
+                else if (showBalloon)
+                {
                     ShowBalloon("配置已重载",
                         shouldRun ? _config.WatchPath : "监控保持停止",
                         ToolTipIcon.Info);
+                }
             }
             catch (Exception ex)
             {
@@ -340,6 +353,8 @@ namespace FileMonitorTool
         private void Exit()
         {
             if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
+            if (_executor != null) { _executor.Dispose(); _executor = null; }
+
             _notifyIcon.Visible = false;
             Application.ExitThread();
         }
@@ -347,6 +362,7 @@ namespace FileMonitorTool
         public void Dispose()
         {
             if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
+            if (_executor != null) { _executor.Dispose(); _executor = null; }
 
             try { _notifyIcon.Visible = false; } catch { }
             try { _notifyIcon.Dispose(); } catch { }

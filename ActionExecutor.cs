@@ -2,41 +2,69 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace FileMonitorTool
 {
-    internal sealed class ActionExecutor
+    internal sealed class ActionExecutor : IDisposable
     {
-        private const int TimeoutMs = 10 * 60 * 1000; // 10 分钟
-        private readonly string _template;
+        private const int TimeoutMs = 10 * 60 * 1000;
+        private readonly Config _config;
+        private readonly SemaphoreSlim _semaphore;
+        private volatile bool _disposed;
 
-        public ActionExecutor(string commandTemplate)
+        public ActionExecutor(Config config)
         {
-            _template = commandTemplate ?? "";
+            _config = config;
+            _semaphore = new SemaphoreSlim(Math.Max(1, config.MaxConcurrentActions));
         }
 
         public void Execute(string filePath)
         {
-            if (string.IsNullOrWhiteSpace(_template))
+            var rule = _config.MatchRule(filePath);
+            if (rule == null)
             {
-                Logger.Warn("ActionCommand 未配置，仅记录事件: " + filePath);
+                if (_config.LogUnmatched)
+                    Logger.Info("未匹配规则，已忽略: " + filePath);
                 return;
             }
 
-            string command = _template
+            string command = BuildCommand(rule.Command, filePath);
+            string workDir = Path.GetDirectoryName(filePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+
+            Task.Run(async () =>
+            {
+                if (_disposed) return;
+                try { await _semaphore.WaitAsync().ConfigureAwait(false); }
+                catch (ObjectDisposedException) { return; }
+
+                try
+                {
+                    if (_disposed) return;
+                    RunCommand(command, workDir, rule);
+                }
+                finally
+                {
+                    try { _semaphore.Release(); } catch (ObjectDisposedException) { }
+                }
+            });
+        }
+
+        private static string BuildCommand(string template, string filePath)
+        {
+            return template
                 .Replace("{filepath}", filePath)
                 .Replace("{filename}", Path.GetFileName(filePath))
                 .Replace("{directory}", Path.GetDirectoryName(filePath) ?? "")
                 .Replace("{ext}", Path.GetExtension(filePath).TrimStart('.'));
-
-            string workDir = Path.GetDirectoryName(filePath) ?? AppDomain.CurrentDomain.BaseDirectory;
-
-            Task.Run(() => RunCommand(command, workDir));
         }
 
-        private void RunCommand(string command, string workDir)
+        private void RunCommand(string command, string workDir, ActionRule rule)
         {
+            string tag = "Action." + rule.Order +
+                         (rule.MatchType == RuleMatchType.Name ? " [Name]" : " [Ext]");
+
             try
             {
                 string exePath, arguments;
@@ -44,7 +72,6 @@ namespace FileMonitorTool
 
                 if (TrySplitExecutable(command, out exePath, out arguments))
                 {
-                    // 直接启动 exe：绕过 cmd 的引号剥离问题
                     psi = new ProcessStartInfo
                     {
                         FileName = exePath,
@@ -56,11 +83,10 @@ namespace FileMonitorTool
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     };
-                    Logger.Info("直接启动: " + exePath + " " + arguments);
+                    Logger.Info("[" + tag + "] 直接启动: " + exePath + " " + arguments);
                 }
                 else
                 {
-                    // 内置命令 / 环境变量 / 重定向，交给 cmd；/s 保证引号正确处理
                     psi = new ProcessStartInfo
                     {
                         FileName = "cmd.exe",
@@ -72,14 +98,14 @@ namespace FileMonitorTool
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     };
-                    Logger.Info("通过 cmd 执行: " + command);
+                    Logger.Info("[" + tag + "] 通过 cmd 执行: " + command);
                 }
 
                 using (var p = Process.Start(psi))
                 {
                     if (p == null)
                     {
-                        Logger.Error("无法启动进程: " + command);
+                        Logger.Error("[" + tag + "] 无法启动进程: " + command);
                         return;
                     }
 
@@ -90,7 +116,7 @@ namespace FileMonitorTool
 
                     if (!exited)
                     {
-                        Logger.Warn("动作执行超时（" + TimeoutMs + "ms），尝试结束进程: " + command);
+                        Logger.Warn("[" + tag + "] 超时（" + TimeoutMs + "ms），尝试结束进程: " + command);
                         try { p.Kill(); } catch { }
                     }
 
@@ -98,50 +124,37 @@ namespace FileMonitorTool
                     string stderr = SafeGet(stderrTask);
 
                     if (!string.IsNullOrWhiteSpace(stdout))
-                        Logger.Info("输出: " + stdout.Trim());
+                        Logger.Info("[" + tag + "] 输出: " + stdout.Trim());
                     if (!string.IsNullOrWhiteSpace(stderr))
-                        Logger.Warn("错误输出: " + stderr.Trim());
+                        Logger.Warn("[" + tag + "] 错误输出: " + stderr.Trim());
 
                     if (!exited)
-                    {
-                        Logger.Error("动作执行超时: " + command);
-                    }
+                        Logger.Error("[" + tag + "] 动作执行超时: " + command);
                     else if (p.ExitCode != 0)
-                    {
-                        Logger.Error("动作执行失败，退出码 " + p.ExitCode + ": " + command);
-                    }
+                        Logger.Error("[" + tag + "] 动作执行失败，退出码 " + p.ExitCode + ": " + command);
                     else
-                    {
-                        Logger.Info("动作执行完成: " + command);
-                    }
+                        Logger.Info("[" + tag + "] 动作执行完成: " + command);
                 }
             }
             catch (Win32Exception ex)
             {
                 if (ex.NativeErrorCode == 740)
-                    Logger.Error("需要管理员权限才能执行（请以管理员运行本工具，或调整该 exe 的清单）: " + command, ex);
+                    Logger.Error("[" + tag + "] 需要管理员权限才能执行: " + command, ex);
                 else
-                    Logger.Error("启动进程失败（Win32 错误 " + ex.NativeErrorCode + "）: " + command, ex);
+                    Logger.Error("[" + tag + "] 启动进程失败（Win32 " + ex.NativeErrorCode + "）: " + command, ex);
             }
             catch (Exception ex)
             {
-                Logger.Error("动作执行失败: " + command, ex);
+                Logger.Error("[" + tag + "] 动作执行失败: " + command, ex);
             }
         }
 
         private static string SafeGet(Task<string> task)
         {
-            try
-            {
-                return task.Wait(2000) ? task.Result : "";
-            }
+            try { return task.Wait(2000) ? task.Result : ""; }
             catch { return ""; }
         }
 
-        /// <summary>
-        /// 把命令模板拆成“可执行文件 + 参数”，支持首段带引号。
-        /// 仅识别 .exe/.com；.bat/.cmd 和内置命令仍走 cmd。
-        /// </summary>
         private static bool TrySplitExecutable(string command, out string fileName, out string arguments)
         {
             fileName = null;
@@ -162,16 +175,8 @@ namespace FileMonitorTool
             else
             {
                 int space = s.IndexOf(' ');
-                if (space < 0)
-                {
-                    exe = s;
-                    consumed = s.Length;
-                }
-                else
-                {
-                    exe = s.Substring(0, space);
-                    consumed = space;
-                }
+                if (space < 0) { exe = s; consumed = s.Length; }
+                else { exe = s.Substring(0, space); consumed = space; }
             }
 
             string ext = Path.GetExtension(exe).ToLowerInvariant();
@@ -180,6 +185,11 @@ namespace FileMonitorTool
             fileName = exe;
             arguments = consumed < s.Length ? s.Substring(consumed).TrimStart() : "";
             return true;
+        }
+
+        public void Dispose()
+        {
+            _disposed = true;
         }
     }
 }
