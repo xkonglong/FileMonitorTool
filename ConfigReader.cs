@@ -6,283 +6,353 @@ using System.Text.RegularExpressions;
 
 namespace FileMonitorTool
 {
-    internal enum RuleMatchType
+    /// <summary>配置非法时抛出，调用方应停止加载并提示用户。</summary>
+    internal sealed class ConfigException : Exception
     {
-        Ext,
-        Name
+        public ConfigException(string message) : base(message) { }
     }
 
     internal sealed class ActionRule
     {
+        public string Name { get; set; }
         public int Order { get; set; }
-        public RuleMatchType MatchType { get; set; }
         public string[] Patterns { get; set; }
         public string Command { get; set; }
         public string RawPattern { get; set; }
+        public int FolderOrder { get; set; }
+    }
+
+    internal sealed class FolderConfig
+    {
+        public int Order { get; set; }
+        public string Name { get; set; }
+        public string Path { get; set; }
+        public bool IncludeSub { get; set; }
+        public bool WatchChanged { get; set; }
+        public int DebounceMs { get; set; }
+        public List<ActionRule> Rules { get; set; }
+
+        public FolderConfig()
+        {
+            Rules = new List<ActionRule>();
+        }
     }
 
     internal sealed class Config
     {
-        public string WatchPath { get; set; }
-        public bool IncludeSubdirectories { get; set; }
+        public bool IncludeSub { get; set; }
         public bool WatchChanged { get; set; }
         public int DebounceMs { get; set; }
         public string LogFile { get; set; }
         public int MaxConcurrentActions { get; set; }
         public bool LogUnmatched { get; set; }
-        public List<ActionRule> Rules { get; set; }
 
-        private string _legacyWarning;
+        public List<FolderConfig> Folders { get; set; }
+        public List<ActionRule> GlobalRules { get; set; }
+
         private readonly List<string> _warnings = new List<string>();
-        private string[] _extPatterns = new string[0];
-        private string[] _namePatterns = new string[0];
-
-        public string LegacyWarning { get { return _legacyWarning; } }
         public IList<string> Warnings { get { return _warnings; } }
 
         public Config()
         {
-            Rules = new List<ActionRule>();
+            Folders = new List<FolderConfig>();
+            GlobalRules = new List<ActionRule>();
         }
 
-        public static Config Load(string path)
+        public ActionRule MatchRule(string filePath, int folderOrder)
         {
-            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            var duplicateKeys = new List<string>();
-
-            if (File.Exists(path))
-            {
-                foreach (string rawLine in File.ReadAllLines(path))
-                {
-                    string line = rawLine.Trim();
-                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
-                    int idx = line.IndexOf('=');
-                    if (idx <= 0) continue;
-
-                    string key = line.Substring(0, idx).Trim();
-                    string value = line.Substring(idx + 1).Trim();
-
-                    if (dict.ContainsKey(key))
-                        duplicateKeys.Add(key);
-
-                    dict[key] = value;
-                }
-            }
-
-            var cfg = new Config
-            {
-                WatchPath = Get(dict, "WatchPath", ""),
-                IncludeSubdirectories = GetBool(dict, "IncludeSubdirectories", false),
-                WatchChanged = GetBool(dict, "WatchChanged", false),
-                DebounceMs = GetInt(dict, "DebounceMs", 300),
-                LogFile = Get(dict, "LogFile", "monitor.log"),
-                MaxConcurrentActions = GetInt(dict, "MaxConcurrentActions", 4),
-                LogUnmatched = GetBool(dict, "LogUnmatched", true),
-            };
-
-            if (cfg.MaxConcurrentActions < 1) cfg.MaxConcurrentActions = 1;
-
-            // ---- 重复 key 警告 ----
-            foreach (var k in duplicateKeys.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                cfg._warnings.Add(string.Format(
-                    "配置项 '{0}' 重复出现，只有最后一次的值生效，请删除多余的行。", k));
-            }
-
-            // ---- 先按 N 收集原始值 ----
-            var rawExt  = new Dictionary<int, string>();
-            var rawName = new Dictionary<int, string>();
-            var rawCmd  = new Dictionary<int, string>();
-
-            foreach (var kv in dict)
-            {
-                if (!kv.Key.StartsWith("Action.", StringComparison.OrdinalIgnoreCase)) continue;
-                string rest = kv.Key.Substring("Action.".Length);
-                int dot = rest.IndexOf('.');
-                if (dot <= 0) continue;
-
-                int n;
-                if (!int.TryParse(rest.Substring(0, dot), out n)) continue;
-                string field = rest.Substring(dot + 1);
-
-                if (string.Equals(field, "Ext", StringComparison.OrdinalIgnoreCase))
-                    rawExt[n] = kv.Value;
-                else if (string.Equals(field, "Name", StringComparison.OrdinalIgnoreCase))
-                    rawName[n] = kv.Value;
-                else if (string.Equals(field, "Command", StringComparison.OrdinalIgnoreCase))
-                    rawCmd[n] = kv.Value;
-            }
-
-            // ---- 按 N 升序构造规则 ----
-            var allOrders = new HashSet<int>(rawExt.Keys);
-            allOrders.UnionWith(rawName.Keys);
-            allOrders.UnionWith(rawCmd.Keys);   // ← 修复：只有 Command 的 Action 也纳入遍历
-
-            foreach (int n in allOrders.OrderBy(x => x))
-            {
-                string ext, name, cmd;
-                rawExt.TryGetValue(n, out ext);
-                rawName.TryGetValue(n, out name);
-                rawCmd.TryGetValue(n, out cmd);
-
-                if (string.IsNullOrWhiteSpace(cmd))
-                {
-                    cfg._warnings.Add(string.Format("Action.{0} 缺少 Command，已忽略。", n));
-                    continue;
-                }
-
-                ActionRule rule;
-                if (!string.IsNullOrWhiteSpace(name))
-                {
-                    if (!string.IsNullOrWhiteSpace(ext))
-                        cfg._warnings.Add(string.Format(
-                            "Action.{0} 同时包含 Ext 和 Name，将只使用 Name。", n));
-
-                    var patterns = ParseNamePatterns(name);
-                    if (patterns.Length == 0)
-                    {
-                        cfg._warnings.Add(string.Format("Action.{0} 的 Name 为空，已忽略。", n));
-                        continue;
-                    }
-
-                    rule = new ActionRule
-                    {
-                        Order = n,
-                        MatchType = RuleMatchType.Name,
-                        Patterns = patterns,
-                        Command = cmd,
-                        RawPattern = name,
-                    };
-                }
-                else if (!string.IsNullOrWhiteSpace(ext))
-                {
-                    var patterns = ParseExtPatterns(ext);
-                    if (patterns.Length == 0)
-                    {
-                        cfg._warnings.Add(string.Format("Action.{0} 的 Ext 为空，已忽略。", n));
-                        continue;
-                    }
-
-                    rule = new ActionRule
-                    {
-                        Order = n,
-                        MatchType = RuleMatchType.Ext,
-                        Patterns = patterns,
-                        Command = cmd,
-                        RawPattern = ext,
-                    };
-                }
-                else
-                {
-                    cfg._warnings.Add(string.Format("Action.{0} 缺少 Ext 或 Name，已忽略。", n));
-                    continue;
-                }
-
-                cfg.Rules.Add(rule);
-            }
-
-            // ---- 旧配置自动兼容 ----
-            string oldAction = Get(dict, "ActionCommand", "");
-            if (cfg.Rules.Count == 0 && !string.IsNullOrEmpty(oldAction))
-            {
-                string oldFilter = Get(dict, "FileFilter", "*.*");
-                cfg.Rules.Add(new ActionRule
-                {
-                    Order = 1,
-                    MatchType = RuleMatchType.Ext,
-                    RawPattern = oldFilter,
-                    Patterns = ParseLegacyFilter(oldFilter),
-                    Command = oldAction,
-                });
-                cfg._legacyWarning =
-                    "检测到旧版 FileFilter/ActionCommand，已自动转换为 Action.1（Ext）规则；请尽快改用 Action.N.Ext / Action.N.Name 格式。";
-            }
-
-            // ---- 预筛集合 ----
-            cfg._extPatterns = cfg.Rules
-                .Where(r => r.MatchType == RuleMatchType.Ext)
-                .SelectMany(r => r.Patterns)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            cfg._namePatterns = cfg.Rules
-                .Where(r => r.MatchType == RuleMatchType.Name)
-                .SelectMany(r => r.Patterns)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            // ---- 重复模式校验 ----
-            var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in cfg.Rules)
-            {
-                foreach (var p in r.Patterns)
-                {
-                    string key = r.MatchType + ":" + p;
-                    int firstOrder;
-                    if (seen.TryGetValue(key, out firstOrder))
-                    {
-                        cfg._warnings.Add(string.Format(
-                            "{0} '{1}' 同时出现在 Action.{2} 和 Action.{3}，将使用 Action.{2}。",
-                            r.MatchType == RuleMatchType.Ext ? "扩展名" : "文件名模式",
-                            p, firstOrder, r.Order));
-                    }
-                    else
-                    {
-                        seen[key] = r.Order;
-                    }
-                }
-            }
-
-            // ---- '*' 必须最后一条 ----
-            for (int i = 0; i < cfg.Rules.Count - 1; i++)
-            {
-                if (cfg.Rules[i].Patterns.Contains("*"))
-                {
-                    cfg._warnings.Add(string.Format(
-                        "Action.{0} 使用了通配符 '*'，但它不是最后一条规则，后续规则永远不会命中。",
-                        cfg.Rules[i].Order));
-                }
-            }
-
-            return cfg;
-        }
-
-        public ActionRule MatchRule(string filePath)
-        {
-            string fileName = Path.GetFileName(filePath);
             string ext = Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
 
-            foreach (var rule in Rules)
+            if (folderOrder > 0)
             {
-                string target = rule.MatchType == RuleMatchType.Name ? fileName : ext;
+                var folder = Folders.FirstOrDefault(f => f.Order == folderOrder);
+                if (folder != null)
+                {
+                    var hit = MatchInList(folder.Rules, ext);
+                    if (hit != null) return hit;
+                }
+            }
+
+            return MatchInList(GlobalRules, ext);
+        }
+
+        private static ActionRule MatchInList(List<ActionRule> rules, string ext)
+        {
+            foreach (var rule in rules)
+            {
                 foreach (var pattern in rule.Patterns)
                 {
                     if (pattern == "*") return rule;
-                    if (WildcardMatch(target, pattern)) return rule;
+                    if (WildcardMatch(ext, pattern)) return rule;
                 }
             }
             return null;
         }
 
-        public bool ShouldTrackFile(string fileName)
+        public bool ShouldTrackFile(string fileName, int folderOrder)
         {
-            if (_extPatterns.Length == 0 && _namePatterns.Length == 0) return false;
             if (string.IsNullOrEmpty(fileName)) return false;
-
-            foreach (var pattern in _namePatterns)
-            {
-                if (pattern == "*") return true;
-                if (WildcardMatch(fileName, pattern)) return true;
-            }
-
             string ext = Path.GetExtension(fileName).TrimStart('.').ToLowerInvariant();
-            foreach (var pattern in _extPatterns)
+
+            if (folderOrder > 0)
             {
-                if (pattern == "*") return true;
-                if (WildcardMatch(ext, pattern)) return true;
+                var folder = Folders.FirstOrDefault(f => f.Order == folderOrder);
+                if (folder != null && AnyPatternMatches(folder.Rules, ext)) return true;
             }
 
+            return AnyPatternMatches(GlobalRules, ext);
+        }
+
+        private static bool AnyPatternMatches(List<ActionRule> rules, string ext)
+        {
+            foreach (var rule in rules)
+            {
+                foreach (var pattern in rule.Patterns)
+                {
+                    if (pattern == "*") return true;
+                    if (WildcardMatch(ext, pattern)) return true;
+                }
+            }
             return false;
+        }
+
+        // ---- 带行号的配置项 ----
+        private sealed class ConfigEntry
+        {
+            public string Value;
+            public int LineNo;
+            public ConfigEntry(string v, int n) { Value = v; LineNo = n; }
+        }
+
+        public static Config Load(string path)
+        {
+            if (!File.Exists(path))
+                throw new ConfigException("配置文件不存在: " + path);
+
+            var cfg = new Config();
+
+            var sections = new Dictionary<string, Dictionary<string, ConfigEntry>>(StringComparer.OrdinalIgnoreCase);
+            var duplicateKeys = new List<string>();
+
+            string currentSection = null;
+            int lineNo = 0;
+
+            foreach (string rawLine in File.ReadAllLines(path))
+            {
+                lineNo++;
+                string line = rawLine.Trim();
+                if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+
+                if (line[0] == '[')
+                {
+                    if (line[line.Length - 1] != ']')
+                        throw new ConfigException(string.Format("第 {0} 行：节声明缺少 ']'。", lineNo));
+
+                    currentSection = line.Substring(1, line.Length - 2).Trim();
+                    if (currentSection.Length == 0)
+                        throw new ConfigException(string.Format("第 {0} 行：节名不能为空。", lineNo));
+
+                    if (!sections.ContainsKey(currentSection))
+                        sections[currentSection] = new Dictionary<string, ConfigEntry>(StringComparer.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                int idx = line.IndexOf('=');
+                if (idx <= 0)
+                    throw new ConfigException(string.Format("第 {0} 行：缺少 '=' 或键名为空。", lineNo));
+
+                if (currentSection == null)
+                    throw new ConfigException(string.Format("第 {0} 行：键值必须写在某个节内（如 [Global] 或 [Folder:名字]）。", lineNo));
+
+                string key = line.Substring(0, idx).Trim();
+                string value = line.Substring(idx + 1).Trim();
+
+                if (key.Length == 0)
+                    throw new ConfigException(string.Format("第 {0} 行：键名为空。", lineNo));
+
+                var target = sections[currentSection];
+
+                if (target.ContainsKey(key))
+                    duplicateKeys.Add("[" + currentSection + "] " + key);
+
+                target[key] = new ConfigEntry(value, lineNo);
+            }
+
+            if (sections.Count == 0)
+                throw new ConfigException("配置文件为空，没有任何节。");
+
+            // ---- Global 节 ----
+            Dictionary<string, ConfigEntry> global;
+            if (!sections.TryGetValue("Global", out global))
+                throw new ConfigException("缺少 [Global] 节。");
+
+            cfg.IncludeSub = GetBool(global, "IncludeSub", false);
+            cfg.WatchChanged = GetBool(global, "WatchChanged", false);
+            cfg.DebounceMs = GetInt(global, "DebounceMs", 300);
+            cfg.LogFile = GetStr(global, "LogFile", "monitor.log");
+            cfg.MaxConcurrentActions = GetInt(global, "MaxConcurrentActions", 4);
+            cfg.LogUnmatched = GetBool(global, "LogUnmatched", true);
+
+            if (cfg.DebounceMs < 10)
+                throw new ConfigException("[Global] DebounceMs 必须 >= 10。");
+            if (cfg.MaxConcurrentActions < 1)
+                throw new ConfigException("[Global] MaxConcurrentActions 必须 >= 1。");
+
+            foreach (var k in duplicateKeys.Distinct(StringComparer.OrdinalIgnoreCase))
+                cfg._warnings.Add(string.Format("配置项 {0} 重复出现，只有最后一次的值生效。", k));
+
+            // ---- Global 节内的全局规则 ----
+            var globalReserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "IncludeSub", "WatchChanged", "DebounceMs",
+                "LogFile", "MaxConcurrentActions", "LogUnmatched"
+            };
+            ParseRules(global, globalReserved, cfg.GlobalRules, 0, cfg._warnings, null);
+
+            // ---- Folder 节 ----
+            int folderOrder = 0;
+            foreach (var kv in sections)
+            {
+                string sectionName = kv.Key;
+                if (!sectionName.StartsWith("Folder:", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string folderName = sectionName.Substring("Folder:".Length).Trim();
+                if (folderName.Length == 0)
+                    throw new ConfigException("存在空的 [Folder:] 节。");
+
+                var sec = kv.Value;
+                ConfigEntry pathEntry;
+                if (!sec.TryGetValue("Path", out pathEntry) || string.IsNullOrWhiteSpace(pathEntry.Value))
+                    throw new ConfigException(string.Format("[Folder:{0}] 缺少 Path 或 Path 为空。", folderName));
+
+                folderOrder++;
+                var folder = new FolderConfig
+                {
+                    Order = folderOrder,
+                    Name = folderName,
+                    Path = pathEntry.Value.Trim(),
+                    IncludeSub = cfg.IncludeSub,
+                    WatchChanged = cfg.WatchChanged,
+                    DebounceMs = cfg.DebounceMs,
+                };
+
+                ConfigEntry ce; bool b; int i;
+                if (sec.TryGetValue("IncludeSub", out ce))
+                {
+                    if (!bool.TryParse(ce.Value, out b))
+                        throw new ConfigException(string.Format("[Folder:{0}] IncludeSub 必须是 true 或 false。", folderName));
+                    folder.IncludeSub = b;
+                }
+
+                if (sec.TryGetValue("WatchChanged", out ce))
+                {
+                    if (!bool.TryParse(ce.Value, out b))
+                        throw new ConfigException(string.Format("[Folder:{0}] WatchChanged 必须是 true 或 false。", folderName));
+                    folder.WatchChanged = b;
+                }
+
+                if (sec.TryGetValue("DebounceMs", out ce))
+                {
+                    if (!int.TryParse(ce.Value, out i) || i < 10)
+                        throw new ConfigException(string.Format("[Folder:{0}] DebounceMs 必须是 >= 10 的整数。", folderName));
+                    folder.DebounceMs = i;
+                }
+
+                var folderReserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Path", "IncludeSub", "WatchChanged", "DebounceMs"
+                };
+                ParseRules(sec, folderReserved, folder.Rules, folderOrder, cfg._warnings, folderName);
+
+                cfg.Folders.Add(folder);
+            }
+
+            if (cfg.Folders.Count == 0)
+                throw new ConfigException("没有任何有效的 [Folder:xxx] 节，无法启动监控。");
+
+            return cfg;
+        }
+
+        /// <summary>
+        /// 解析节内规则：裸键 K=V 为匹配模式，K.Command=V 为命令。
+        /// 严格按行号排序，书写顺序即优先级。
+        /// </summary>
+        private static void ParseRules(
+            Dictionary<string, ConfigEntry> sec,
+            HashSet<string> reserved,
+            List<ActionRule> target,
+            int folderOrder,
+            List<string> warnings,
+            string folderName)
+        {
+            string prefix = folderName == null ? "[Global]" : "[Folder:" + folderName + "]";
+
+            var ruleEntries = new List<KeyValuePair<string, ConfigEntry>>();
+
+            foreach (var kv in sec)
+            {
+                string key = kv.Key;
+                if (reserved.Contains(key)) continue;
+                if (key.EndsWith(".Command", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (key.IndexOf('.') >= 0)
+                {
+                    warnings.Add(string.Format(
+                        "{0} 键 '{1}' 含 '.'，规则名不能含点，已忽略。", prefix, key));
+                    continue;
+                }
+
+                ruleEntries.Add(kv);
+            }
+
+            ruleEntries.Sort((a, b) => a.Value.LineNo.CompareTo(b.Value.LineNo));
+
+            int order = 0;
+            foreach (var kv in ruleEntries)
+            {
+                string ruleName = kv.Key;
+                string rawPattern = kv.Value.Value;
+
+                ConfigEntry cmdEntry;
+                string cmdKey = ruleName + ".Command";
+                if (!sec.TryGetValue(cmdKey, out cmdEntry) || string.IsNullOrWhiteSpace(cmdEntry.Value))
+                {
+                    warnings.Add(string.Format("{0} 规则 '{1}' 缺少 .Command，已忽略。", prefix, ruleName));
+                    continue;
+                }
+
+                var patterns = ParseExtPatterns(rawPattern);
+                if (patterns.Length == 0)
+                {
+                    warnings.Add(string.Format("{0} 规则 '{1}' 的模式为空，已忽略。", prefix, ruleName));
+                    continue;
+                }
+
+                order++;
+                target.Add(new ActionRule
+                {
+                    Name = ruleName,
+                    Order = order,
+                    Patterns = patterns,
+                    Command = cmdEntry.Value,
+                    RawPattern = rawPattern,
+                    FolderOrder = folderOrder,
+                });
+            }
+
+            // 孤立 .Command
+            foreach (var kv in sec)
+            {
+                string key = kv.Key;
+                if (reserved.Contains(key)) continue;
+                if (!key.EndsWith(".Command", StringComparison.OrdinalIgnoreCase)) continue;
+                string baseName = key.Substring(0, key.Length - ".Command".Length);
+                if (!sec.ContainsKey(baseName))
+                {
+                    warnings.Add(string.Format(
+                        "{0} 键 '{1}' 没有对应的模式键 '{2}'，已忽略。", prefix, key, baseName));
+                }
+            }
         }
 
         private static string[] ParseExtPatterns(string raw)
@@ -306,38 +376,6 @@ namespace FileMonitorTool
             return result.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         }
 
-        private static string[] ParseNamePatterns(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return new string[0];
-            var result = new List<string>();
-
-            foreach (var part in raw.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string s = part.Trim();
-                if (s.Length > 0) result.Add(s);
-            }
-
-            return result.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        }
-
-        private static string[] ParseLegacyFilter(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return new[] { "*" };
-
-            var result = new List<string>();
-            foreach (var part in raw.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string s = part.Trim();
-                if (s.Length == 0) continue;
-                if (s == "*.*" || s == "*") { result.Add("*"); continue; }
-                if (s.StartsWith("*.")) s = s.Substring(2);
-                else if (s.StartsWith("*")) s = s.Substring(1);
-                s = s.TrimStart('.').ToLowerInvariant();
-                if (s.Length > 0) result.Add(s);
-            }
-            return result.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        }
-
         private static bool WildcardMatch(string input, string pattern)
         {
             if (pattern == "*") return true;
@@ -350,87 +388,147 @@ namespace FileMonitorTool
             return Regex.IsMatch(input, regex, RegexOptions.IgnoreCase);
         }
 
-        private static string Get(Dictionary<string, string> d, string key, string def)
+        private static string GetStr(Dictionary<string, ConfigEntry> d, string key, string def)
         {
-            string v;
-            return d.TryGetValue(key, out v) && !string.IsNullOrEmpty(v) ? v : def;
+            ConfigEntry e;
+            return d.TryGetValue(key, out e) && !string.IsNullOrEmpty(e.Value) ? e.Value : def;
         }
 
-        private static int GetInt(Dictionary<string, string> d, string key, int def)
+        private static int GetInt(Dictionary<string, ConfigEntry> d, string key, int def)
         {
+            ConfigEntry e;
             int v;
-            return d.TryGetValue(key, out var s) && int.TryParse(s, out v) ? v : def;
+            return d.TryGetValue(key, out e) && int.TryParse(e.Value, out v) ? v : def;
         }
 
-        private static bool GetBool(Dictionary<string, string> d, string key, bool def)
+        private static bool GetBool(Dictionary<string, ConfigEntry> d, string key, bool def)
         {
+            ConfigEntry e;
             bool v;
-            return d.TryGetValue(key, out var s) && bool.TryParse(s, out v) ? v : def;
+            return d.TryGetValue(key, out e) && bool.TryParse(e.Value, out v) ? v : def;
         }
 
         public const string DefaultText =
-@"# ===== 文件监控工具配置 v1.3 =====
-# 修改保存后，右键托盘图标 -> ""重新加载配置"" 即可生效
+@"# =====================================================================
+#  FileMonitorTool 配置文件
+# =====================================================================
+# 修改保存后，右键托盘图标 -> ""重新加载配置"" 即可生效，无需重启程序。
+#
+# 格式约定：
+#   - 以 # 或 ; 开头的行是注释，空行忽略。
+#   - 所有键值必须写在某个节内，节用 [节名] 声明。
+#   - 同一个节内的同一个键只能出现一次，重复写只有最后一行生效。
+#   - 节内规则的优先级严格按书写顺序：越靠前越优先，兜底 '*' 规则写在最后。
+#   - 任何结构错误（缺少 [Global]、[Folder:x] 缺少 Path、true/false 写错、
+#     数字非法等）都会拒绝启动，并在日志和托盘气泡里提示原因。
+#   - 单条规则写错（缺 .Command、规则名含点等）只跳过该规则，不影响其他规则。
 
-# 要监控的文件夹（必须存在）
-WatchPath=C:\DropFolder
+# =====================================================================
+#  [Global] 全局设置节（必需）
+# =====================================================================
+# 这里的值作为所有文件夹的默认值；[Folder:x] 节里可以单独覆盖其中四项。
 
-# 是否监控子目录
-IncludeSubdirectories=false
+[Global]
 
-# 是否监听""已有文件内容被修改""（默认只关注新放入/改名进来的文件）
+# 是否递归监控子目录。默认 false。
+#   false = 只监控 Path 这一层，子文件夹里的变化不触发。
+#   true  = 递归所有层级的子文件夹。
+# 可被 [Folder:x] 节里的 IncludeSub  覆盖。
+IncludeSub =false
+
+# 是否监听""已有文件内容被修改""。默认 false。
+#   false = 只关注新放入、改名进来的文件（大多数场景够用，事件量最小）。
+#   true  = 文件内容被改写时也触发（比如编辑器保存已有文件）。
+# 注意：开启后事件量明显增加，可能对同一文件重复触发，建议配合较大的 DebounceMs。
+# 可被 [Folder:x] 节里的 WatchChanged 覆盖。
 WatchChanged=false
 
-# 去抖窗口（毫秒）：文件连续变化时，静默超过该时长才触发动作
+# 去抖窗口（毫秒），默认 300，最小 10。
+# 含义：文件连续变化时，静默超过这个时长才认为""文件已稳定""，然后触发规则。
+# 作用：合并同一文件的连续事件（复制大文件、编辑器多次保存会产生多个事件）。
+# 调大：批量放文件时减少重复触发，但动作延迟增加。
+# 调小：响应更快，但更容易对同一文件重复执行。
+# 可被 [Folder:x] 节里的 DebounceMs 覆盖。
 DebounceMs=300
 
-# 同时执行的最大动作数
+# 同时执行的最大动作数，默认 4，最小 1。
+# 一批文件同时触发时，超出上限的动作会排队，避免瞬间拉起大量进程。
+# 只在 [Global] 设置，不能被文件夹覆盖。
 MaxConcurrentActions=4
 
-# 未匹配任何规则的文件是否记日志
+# 未匹配任何规则的文件是否记日志，默认 true。
+#   true  = 日志里输出""未匹配任何规则，已忽略: 路径""，便于排查配置。
+#   false = 静默丢弃，不记日志。
+# 只在 [Global] 设置，不能被文件夹覆盖。
 LogUnmatched=true
 
-# 日志文件（相对路径基于程序目录）
+# 日志文件路径，默认 monitor.log。
+# 相对路径基于 exe 所在目录；绝对路径按原样使用。
+# 日志超过 1MB 自动轮转为 monitor.log.1（只保留一份备份）。
+# 只在 [Global] 设置，不能被文件夹覆盖。
 LogFile=monitor.log
 
-# ===== 规则表 =====
-# 格式（每条规则二选一）：
-#   Action.<序号>.Ext=<扩展名模式>   + Action.<序号>.Command=<命令>
-#   Action.<序号>.Name=<文件名模式>  + Action.<序号>.Command=<命令>
+# ---------------------------------------------------------------------
+# 全局规则（可选）：写在 [Global] 节里、上面保留键之外的裸键。
+# 所有文件夹都会先查自己的规则，都不中时再查这里。
+# 写法与文件夹内规则相同：规则名=扩展名列表 + 规则名.Command=命令。
+# ---------------------------------------------------------------------
+# Log=log
+# Log.Command=copy /Y ""{filepath}"" ""D:\Archive\Logs\{basename}_{timestamp}.{ext}""
+
+# =====================================================================
+#  [Folder:名字] 监控文件夹节
+# =====================================================================
+# 每个要监控的文件夹写一个 [Folder:名字] 节，""名字"" 自取，用于日志和提示。
+# 可以写任意多个，按书写顺序编号。
 #
-# 注意：
-#   1. 同一个 Action.<序号>.<字段> 只能出现一次，重复写只有最后一行生效。
-#   2. Ext/Name 和 Command 必须在同一个序号下成对出现，
-#      写成 Action.1.Ext + Action.2.Command 会导致两条规则都失效。
-
-# Ext  ：按扩展名匹配，分号分隔；支持 pdf / *.pdf / d* / ?df
-# Name ：按完整文件名匹配，分号分隔；支持 * 和 ?，整串锚定、大小写不敏感
-#        例：*月报.xlsx 匹配 ""2026年3月报.xlsx""，不匹配 ""月报.xls""
+# 节内保留键（不能当规则名用）：
+#   Path        必填，监控目录的绝对路径。目录不存在时该文件夹会被跳过，
+#               其余文件夹继续运行，日志和气泡会提示。
+#   IncludeSub      可选，true/false，覆盖全局 IncludeSub 。
+#   WatchChanged 可选，true/false，覆盖全局 WatchChanged。
+#   DebounceMs  可选，整数 >= 10，覆盖全局 DebounceMs。
 #
-# Command：命令行模板，支持占位符：
-#   {filepath} 完整路径   {filename} 文件名
-#   {directory} 所在目录  {ext} 扩展名
+# 节内其他键都是规则，必须成对出现：
+#   规则名=扩展名列表          （规则名不能含点）
+#   规则名.Command=命令行
+# 规则按书写顺序决定优先级；同一文件命中第一条就停止，后面的不再看。
 #
-# 匹配规则：按序号从小到大，第一个命中的规则生效
-# 通配符 '*' 兜底，必须放在最后一条
+# 可用占位符：
+#   {filepath}   完整路径              如 D:\In\报告.docx
+#   {filename}   文件名（含扩展名）     如 报告.docx
+#   {basename}   文件名（不含扩展名）   如 报告
+#   {directory}  所在目录              如 D:\In
+#   {ext}        扩展名（不含点）       如 docx
+#   {timestamp}  时间戳 yyyyMMdd_HHmmss 如 20261109_143012
+#
+# 示例：复制到 D:\down 并加时间戳，不覆盖已有文件
+#   copy /Y ""{filepath}"" ""D:\down\{basename}_{timestamp}.{ext}""
+# =====================================================================
 
-# --- 具体规则优先 ---
-Action.1.Name=*月报.pdf
-Action.1.Command=""D:\Tools\SpecialPrinter.exe"" ""{filepath}""
+[Folder:WeChat]
+# 微信接收目录。把""用户名""替换成你实际的账号目录名。
+Path=D:\xwechat_files\用户名\msg\file\2026-11
 
-Action.2.Name=*月报.xls;*月报.xlsx;*月报.csv
-Action.2.Command=""D:\Tools\MergeTool.exe"" --input ""{filepath}""
+# 递归子文件夹，因为文件可能落在会话子目录里。
+IncludeSub =true
 
-# --- 通用规则 ---
-Action.10.Ext=pdf
-Action.10.Command=""D:\Tools\SumatraPDF.exe"" -print-to-default ""{filepath}""
+# 去抖 1 秒，给微信写完文件留足时间。
+DebounceMs=1000
 
-Action.11.Ext=jpg;jpeg;png
-Action.11.Command=move /Y ""{filepath}"" ""D:\Archive\Images\""
+# 文档类：复制到 D:\down，加时间戳避免覆盖，源文件保留。
+# 如需移动而非复制，把 copy 改成 move。
+Doc=doc;docx;xls;xlsx;ppt;pptx;pdf;txt;csv
+Doc.Command=copy /Y ""{filepath}"" ""D:\down\{basename}_{timestamp}.{ext}""
 
-# --- 兜底（可选） ---
-#Action.99.Ext=*
-#Action.99.Command=echo 未分类文件: ""{filepath}"" >> ""%TEMP%\unmatched.txt""
+[Folder:Down]
+# 下载目录，只监控当前层，不递归。
+Path=D:\down
+IncludeSub =false
+
+# zip 文件：调用 UniExtract 解压到同目录子文件夹（/sub 参数）。
+Zip=zip
+Zip.Command=""D:\Tools\SystemTools\万能解压\UniExtract.exe"" ""{filepath}"" /sub
 ";
     }
 }

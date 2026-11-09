@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -14,8 +16,6 @@ namespace FileMonitorTool
         private const string RunValueName = "FileMonitorTool";
         private const string TrayTextRunning = "文件监控工具 - 运行中";
         private const string TrayTextStopped = "文件监控工具 - 已停止";
-
-        // 与 csproj 中 <EmbeddedResource ... LogicalName="FileMonitorTool.stop.ico" /> 保持一致
         private const string StoppedIconResourceName = "FileMonitorTool.stop.ico";
 
         private readonly string _configPath;
@@ -26,12 +26,11 @@ namespace FileMonitorTool
 
         private readonly Icon _runningIcon;
         private readonly bool _ownsRunningIcon;
-
         private readonly Icon _stoppedIcon;
         private readonly bool _ownsStoppedIcon;
 
         private Config _config;
-        private FileMonitor _monitor;
+        private List<FileMonitor> _monitors = new List<FileMonitor>();
         private ActionExecutor _executor;
         private bool _suppressAutoStartEvent;
 
@@ -106,10 +105,6 @@ namespace FileMonitorTool
             return SystemIcons.Application;
         }
 
-        /// <summary>
-        /// 停止态图标：从程序集嵌入资源（原始 ico 流）读取。
-        /// 取一次后缓存，由本类负责释放。资源缺失时返回 null，调用方回退到运行图标。
-        /// </summary>
         private static Icon LoadStoppedIcon(out bool ownsIcon)
         {
             ownsIcon = false;
@@ -120,7 +115,7 @@ namespace FileMonitorTool
                 {
                     if (stream != null)
                     {
-                        var icon = new Icon(stream);   // 构造时读完整流，之后关闭流安全
+                        var icon = new Icon(stream);
                         ownsIcon = true;
                         return icon;
                     }
@@ -136,32 +131,44 @@ namespace FileMonitorTool
 
         // ---------- 监控开关 ----------
 
+        private bool AnyRunning
+        {
+            get { return _monitors.Any(m => m.IsRunning); }
+        }
+
         private void ToggleMonitor()
         {
-            if (_monitor == null)
+            if (_monitors.Count == 0)
             {
                 ReloadConfig(true);
                 return;
             }
 
-            if (_monitor.IsRunning)
+            if (AnyRunning)
             {
-                _monitor.Stop();
-                Logger.Info("监控已停止");
-                ShowBalloon("监控已停止", _config != null ? _config.WatchPath : "", ToolTipIcon.Info);
+                foreach (var m in _monitors) { try { m.Stop(); } catch { } }
+                Logger.Info("监控已停止（" + _monitors.Count + " 个文件夹）");
+                ShowBalloon("监控已停止", _monitors.Count + " 个文件夹", ToolTipIcon.Info);
             }
             else
             {
-                try
+                int ok = 0, fail = 0;
+                foreach (var m in _monitors)
                 {
-                    _monitor.Start();
-                    ShowBalloon("监控已启动", _config != null ? _config.WatchPath : "", ToolTipIcon.Info);
+                    try { m.Start(); ok++; }
+                    catch (Exception ex)
+                    {
+                        fail++;
+                        Logger.Error("启动监控失败 [Folder:" + m.Folder.Name + "]: " + m.Folder.Path, ex);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    Logger.Error("启动监控失败", ex);
-                    ShowBalloon("启动失败", ex.Message, ToolTipIcon.Error);
-                }
+
+                if (fail == 0)
+                    ShowBalloon("监控已启动", ok + " 个文件夹", ToolTipIcon.Info);
+                else
+                    ShowBalloon("部分启动失败",
+                        "成功 " + ok + " 个，失败 " + fail + " 个（详见日志）",
+                        ToolTipIcon.Warning);
             }
 
             UpdateMonitorMenuState();
@@ -169,7 +176,7 @@ namespace FileMonitorTool
 
         private void UpdateMonitorMenuState()
         {
-            bool running = _monitor != null && _monitor.IsRunning;
+            bool running = AnyRunning;
 
             _toggleMonitorItem.Text = running ? "停止监控" : "开始监控";
             _notifyIcon.Text = running ? TrayTextRunning : TrayTextStopped;
@@ -249,11 +256,13 @@ namespace FileMonitorTool
 
         private void ReloadConfig(bool showBalloon)
         {
-            bool shouldRun = (_monitor == null) || _monitor.IsRunning;
+            bool shouldRun = (_monitors.Count == 0) || AnyRunning;
 
             try
             {
-                if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
+                // 停掉并释放旧实例
+                foreach (var m in _monitors) { try { m.Dispose(); } catch { } }
+                _monitors.Clear();
 
                 if (!File.Exists(_configPath))
                     File.WriteAllText(_configPath, Config.DefaultText);
@@ -261,34 +270,71 @@ namespace FileMonitorTool
                 _config = Config.Load(_configPath);
                 Logger.Initialize(ResolveLogPath(_config.LogFile));
 
-                if (!string.IsNullOrEmpty(_config.LegacyWarning))
-                    Logger.Warn(_config.LegacyWarning);
                 foreach (var w in _config.Warnings)
                     Logger.Warn("[配置校验] " + w);
 
                 if (_executor != null) { _executor.Dispose(); _executor = null; }
                 _executor = new ActionExecutor(_config);
 
-                _monitor = new FileMonitor(_config, OnFileReady);
+                // 每个文件夹一个 FileMonitor；闭包捕获当前 FolderConfig
+                foreach (var folder in _config.Folders)
+                {
+                    var captured = folder;
+                    _monitors.Add(new FileMonitor(_config, captured,
+                        path => OnFileReady(path, captured)));
+                }
 
+                int started = 0, skipped = 0;
                 if (shouldRun)
-                    _monitor.Start();
+                {
+                    foreach (var m in _monitors)
+                    {
+                        try { m.Start(); started++; }
+                        catch (Exception ex)
+                        {
+                            skipped++;
+                            Logger.Error("[Folder:" + m.Folder.Name + "] 启动失败，已跳过: " + m.Folder.Path, ex);
+                        }
+                    }
+                }
                 else
-                    Logger.Info("配置已重载，监控保持停止状态");
+                {
+                    Logger.Info("配置已重载，监控保持停止状态（" + _monitors.Count + " 个文件夹）");
+                }
 
-                bool noRules = _config.Rules.Count == 0;
-                if (noRules)
+                // ---- 启动结果汇总气泡 ----
+                bool noFolders = _monitors.Count == 0;
+                bool noRules = _config.GlobalRules.Count == 0
+                               && _config.Folders.All(f => f.Rules.Count == 0);
+
+                if (noFolders)
+                {
+                    Logger.Warn("没有任何有效的监控文件夹。");
+                    ShowBalloon("没有监控文件夹",
+                        "请检查 config.ini 中的 [Folder:名字] 节和 Path。",
+                        ToolTipIcon.Warning);
+                }
+                else if (noRules)
                 {
                     Logger.Warn("当前没有任何有效规则，不会监控任何文件。");
                     ShowBalloon("没有有效规则",
-                        "请检查 config.ini：每条规则需要同时有 Ext/Name 和 Command。",
+                        "请检查每个 [Folder:名字] 节里的规则（规则名=扩展名 + 规则名.Command）。",
                         ToolTipIcon.Warning);
                 }
                 else if (showBalloon)
                 {
-                    ShowBalloon("配置已重载",
-                        shouldRun ? _config.WatchPath : "监控保持停止",
-                        ToolTipIcon.Info);
+                    if (skipped > 0)
+                    {
+                        ShowBalloon("部分文件夹跳过",
+                            "运行中 " + started + " 个，跳过 " + skipped + " 个（详见日志）",
+                            ToolTipIcon.Warning);
+                    }
+                    else
+                    {
+                        ShowBalloon("配置已重载",
+                            shouldRun ? (started + " 个文件夹监控中") : "监控保持停止",
+                            ToolTipIcon.Info);
+                    }
                 }
             }
             catch (Exception ex)
@@ -302,13 +348,13 @@ namespace FileMonitorTool
             }
         }
 
-        private void OnFileReady(string filePath)
+        private void OnFileReady(string filePath, FolderConfig folder)
         {
-            Logger.Info("检测到文件: " + filePath);
-            try { _executor.Execute(filePath); }
-            catch (Exception ex) { Logger.Error("提交动作失败: " + filePath, ex); }
+            Logger.Info("[" + folder.Name + "] 检测到文件: " + filePath);
+            try { _executor.Execute(filePath, folder.Order); }
+            catch (Exception ex) { Logger.Error("[" + folder.Name + "] 提交动作失败: " + filePath, ex); }
 
-            ShowBalloon("已处理", Path.GetFileName(filePath), ToolTipIcon.Info);
+            ShowBalloon("[" + folder.Name + "] 已处理", Path.GetFileName(filePath), ToolTipIcon.Info);
         }
 
         private void ShowBalloon(string title, string text, ToolTipIcon icon)
@@ -352,7 +398,8 @@ namespace FileMonitorTool
 
         private void Exit()
         {
-            if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
+            foreach (var m in _monitors) { try { m.Dispose(); } catch { } }
+            _monitors.Clear();
             if (_executor != null) { _executor.Dispose(); _executor = null; }
 
             _notifyIcon.Visible = false;
@@ -361,7 +408,8 @@ namespace FileMonitorTool
 
         public void Dispose()
         {
-            if (_monitor != null) { _monitor.Dispose(); _monitor = null; }
+            foreach (var m in _monitors) { try { m.Dispose(); } catch { } }
+            _monitors.Clear();
             if (_executor != null) { _executor.Dispose(); _executor = null; }
 
             try { _notifyIcon.Visible = false; } catch { }

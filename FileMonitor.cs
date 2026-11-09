@@ -7,33 +7,36 @@ namespace FileMonitorTool
     internal sealed class FileMonitor : IDisposable
     {
         private readonly Config _config;
+        private readonly FolderConfig _folder;
         private readonly Action<string> _onFileReady;
         private FileSystemWatcher _watcher;
         private Debouncer _debouncer;
         private volatile bool _running;
 
-        public FileMonitor(Config config, Action<string> onFileReady)
+        public FileMonitor(Config config, FolderConfig folder, Action<string> onFileReady)
         {
             _config = config;
+            _folder = folder;
             _onFileReady = onFileReady;
         }
 
+        public FolderConfig Folder { get { return _folder; } }
         public bool IsRunning { get { return _running; } }
 
         public void Start()
         {
             Stop();
 
-            if (string.IsNullOrWhiteSpace(_config.WatchPath))
-                throw new InvalidOperationException("配置项 WatchPath 为空。");
-            if (!Directory.Exists(_config.WatchPath))
-                throw new DirectoryNotFoundException("监控目录不存在: " + _config.WatchPath);
+            if (string.IsNullOrWhiteSpace(_folder.Path))
+                throw new InvalidOperationException("[Folder:" + _folder.Name + "] Path 为空。");
+            if (!Directory.Exists(_folder.Path))
+                throw new DirectoryNotFoundException("[Folder:" + _folder.Name + "] 目录不存在: " + _folder.Path);
 
-            _debouncer = new Debouncer(_config.DebounceMs, HandleFileSettled);
+            _debouncer = new Debouncer(_folder.DebounceMs, HandleFileSettled);
 
-            _watcher = new FileSystemWatcher(_config.WatchPath)
+            _watcher = new FileSystemWatcher(_folder.Path)
             {
-                IncludeSubdirectories = _config.IncludeSubdirectories,
+                IncludeSubdirectories = _folder.IncludeSub,
                 InternalBufferSize = 64 * 1024,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
                 Filter = "*.*",
@@ -42,15 +45,16 @@ namespace FileMonitorTool
 
             _watcher.Created += OnCreatedOrRenamed;
             _watcher.Renamed += OnRenamed;
-            if (_config.WatchChanged) _watcher.Changed += OnChanged;
+            if (_folder.WatchChanged) _watcher.Changed += OnChanged;
             _watcher.Error += OnWatcherError;
 
             _watcher.EnableRaisingEvents = true;
             _running = true;
 
-            Logger.Info(string.Format("开始监控: {0} | 规则数: {1} | 子目录: {2} | 去抖: {3}ms | 并发: {4}",
-                _config.WatchPath, _config.Rules.Count, _config.IncludeSubdirectories,
-                _config.DebounceMs, _config.MaxConcurrentActions));
+            Logger.Info(string.Format(
+                "开始监控 [Folder:{0}]: {1} | 子目录: {2} | 监听修改: {3} | 去抖: {4}ms | 规则数: {5}",
+                _folder.Name, _folder.Path, _folder.IncludeSub,
+                _folder.WatchChanged, _folder.DebounceMs, _folder.Rules.Count));
         }
 
         public void Stop()
@@ -80,11 +84,10 @@ namespace FileMonitorTool
             if (!_running) return;
             if (string.IsNullOrEmpty(fullPath)) return;
             if (Directory.Exists(fullPath)) return;
-            if (!_config.ShouldTrackFile(Path.GetFileName(fullPath)))
+            if (!_config.ShouldTrackFile(Path.GetFileName(fullPath), _folder.Order))
             {
-                // 预筛掉的文件本来不会进入去抖，但 LogUnmatched 打开时仍留一条痕迹
                 if (_config.LogUnmatched)
-                    Logger.Info("未匹配任何规则，已忽略: " + fullPath);
+                    Logger.Info("[" + _folder.Name + "] 未匹配任何规则，已忽略: " + fullPath);
                 return;
             }
 
@@ -106,7 +109,7 @@ namespace FileMonitorTool
                 }
 
                 Timer retry = null;
-                int delay = Math.Max(500, _config.DebounceMs * 2);
+                int delay = Math.Max(500, _folder.DebounceMs * 2);
                 retry = new Timer(_ =>
                 {
                     try
@@ -115,7 +118,7 @@ namespace FileMonitorTool
                         if (File.Exists(fullPath) && IsFileReady(fullPath))
                             _onFileReady(fullPath);
                         else
-                            Logger.Warn("文件未就绪，已跳过: " + fullPath);
+                            Logger.Warn("[" + _folder.Name + "] 文件未就绪，已跳过: " + fullPath);
                     }
                     catch (Exception ex) { Logger.Error("重试处理失败: " + fullPath, ex); }
                     finally { try { retry.Dispose(); } catch { } }
@@ -132,9 +135,7 @@ namespace FileMonitorTool
             try
             {
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
                     return true;
-                }
             }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
@@ -142,7 +143,7 @@ namespace FileMonitorTool
 
         private void OnWatcherError(object sender, ErrorEventArgs e)
         {
-            Logger.Error("FileSystemWatcher 错误（可能缓冲区溢出，可尝试减少监控范围/关闭子目录）", e.GetException());
+            Logger.Error("[Folder:" + _folder.Name + "] FileSystemWatcher 错误（可能缓冲区溢出）", e.GetException());
         }
 
         public void Dispose() { Stop(); }
