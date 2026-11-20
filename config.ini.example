@@ -7,10 +7,10 @@
 #   - 以 # 或 ; 开头的行是注释，空行忽略。
 #   - 所有键值必须写在某个节内，节用 [节名] 声明。
 #   - 同一个节内的同一个键只能出现一次，重复写只有最后一行生效。
-#   - 节内规则的优先级严格按书写顺序：越靠前越优先，兜底 '*' 规则写在最后。
+#   - 规则的优先级严格按书写顺序：越靠前越优先，兜底规则写在最后。
 #   - 任何结构错误（缺少 [Global]、[Folder:x] 缺少 Path、true/false 写错、
 #     数字非法等）都会拒绝启动，并在日志和托盘气泡里提示原因。
-#   - 单条规则写错（缺 .Command、规则名含点等）只跳过该规则，不影响其他规则。
+#   - 单条规则写错（缺 .command、未知后缀、规则名含点等）只跳过该规则，不影响其他规则。
 
 # =====================================================================
 #  [Global] 全局设置节（必需）
@@ -58,12 +58,30 @@ LogUnmatched=true
 LogFile=monitor.log
 
 # ---------------------------------------------------------------------
-# 全局规则（可选）：写在 [Global] 节里、上面保留键之外的裸键。
+# 全局规则（可选）：写在 [Global] 节里、上面保留键之外的键。
 # 所有文件夹都会先查自己的规则，都不中时再查这里。
-# 写法与文件夹内规则相同：规则名=扩展名列表 + 规则名.Command=命令。
+# 写法与文件夹内规则完全相同：条件后缀 .ext/.name/.fullname + 动作后缀 .command。
 # ---------------------------------------------------------------------
-# Log=log
-# Log.Command=copy /Y "{filepath}" "D:\Archive\Logs\{basename}_{timestamp}.{ext}"
+# Log.ext=log
+# Log.command=copy /Y "{filepath}" "D:\Archive\Logs\{basename}_{timestamp}.{ext}"
+# 日志文件统一归档
+# ---------------------------------------------------------------------
+# 【规则怎么写】
+# 一条规则 = 若干条件 + 一个动作，基础名相同的一组键属于同一条规则：
+#   X.ext=扩展名列表          按扩展名匹配（去点、小写；可写 pdf、*.pdf、d*）
+#   X.name=文件名模式         按文件名匹配（不含扩展名；可写 *行政专员*）
+#   X.fullname=完整文件名模式 按完整文件名匹配（含扩展名；可写 报表*.docx、*.tar.gz）
+#   X.command=命令行          必填，命中后执行
+#
+# 条件后缀至少写一个，可任意组合：同一维度多值用分号分隔（命中任一即可），
+# 不同维度之间必须同时满足。三个维度都支持 * 和 ?，整串锚定、不区分大小写。
+#
+# 优先级按书写顺序（同一规则以最早出现的那行为准），第一条命中就停止。
+#
+# .fullname 用于需要把扩展名写进模式的场景（多段扩展名 *.tar.gz、
+# 或 报表*.docx 这种锚定扩展名的写法）。它与 .ext/.name 同时写时以 .fullname 为准，
+# 并在日志里给出一条提示；日常组合优先用 .ext + .name。
+# ---------------------------------------------------------------------
 
 # =====================================================================
 #  [Folder:名字] 监控文件夹节
@@ -78,9 +96,9 @@ LogFile=monitor.log
 #   WatchChanged 可选，true/false，覆盖全局 WatchChanged。
 #   DebounceMs  可选，整数 >= 10，覆盖全局 DebounceMs。
 #
-# 节内其他键都是规则，必须成对出现：
-#   规则名=扩展名列表          （规则名不能含点）
-#   规则名.Command=命令行
+# 节内其他键都是规则，写法与上文【规则怎么写】一致：
+#   规则名.ext / .name / .fullname = 条件
+#   规则名.command                 = 命令行（必填）
 # 规则按书写顺序决定优先级；同一文件命中第一条就停止，后面的不再看。
 #
 # 可用占位符：
@@ -105,10 +123,15 @@ IncludeSub =true
 # 去抖 1 秒，给微信写完文件留足时间。
 DebounceMs=1000
 
+# 文件名带"行政专员"的，移到 D:\Archive\行政专员。
+# 只写扩展名做不到这一点，这里用 .name 按文件名匹配。
+Admin.name=*行政专员*
+Admin.command=move /Y "{filepath}" "D:\Archive\行政专员\{filename}"
+
 # 文档类：复制到 D:\down，加时间戳避免覆盖，源文件保留。
 # 如需移动而非复制，把 copy 改成 move。
-Doc=doc;docx;xls;xlsx;ppt;pptx;pdf;txt;csv
-Doc.Command=copy /Y "{filepath}" "D:\down\{basename}_{timestamp}.{ext}"
+Doc.ext=doc;docx;xls;xlsx;ppt;pptx;pdf;txt;csv
+Doc.command=copy /Y "{filepath}" "D:\down\{basename}_{timestamp}.{ext}"
 
 [Folder:Down]
 # 下载目录，只监控当前层，不递归。
@@ -116,5 +139,5 @@ Path=D:\down
 IncludeSub =false
 
 # zip 文件：调用 UniExtract 解压到同目录子文件夹（/sub 参数）。
-Zip=zip
-Zip.Command="D:\Tools\SystemTools\万能解压\UniExtract.exe" "{filepath}" /sub
+Zip.ext=zip
+Zip.command="D:\Tools\SystemTools\万能解压\UniExtract.exe" "{filepath}" /sub

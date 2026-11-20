@@ -87,7 +87,7 @@ namespace FileMonitorTool
             if (!_config.ShouldTrackFile(Path.GetFileName(fullPath), _folder.Order))
             {
                 if (_config.LogUnmatched)
-                    Logger.Info("[" + _folder.Name + "] 未匹配任何规则，已忽略: " + fullPath);
+                    Logger.Info("[" + _folder.Name + "] 未匹配任何规则（扩展名/文件名），已忽略: " + fullPath);
                 return;
             }
 
